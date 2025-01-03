@@ -9,8 +9,11 @@ from pox.lib.addresses import IPAddr, IPAddr6, EthAddr
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.arp import arp
 from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.icmp import icmp
 import pox.lib.packet as pkt
 from pox.lib.packet.ethernet import ETHER_BROADCAST
+import struct
+import socket
 
 log = core.getLogger()
 
@@ -49,6 +52,9 @@ PORTS = {
 }
 
 FLOW_IDLE_TIMEOUT = 10
+
+ECHO_REQUEST = 8 
+ECHO_REPLY = 0
 
 class Entry:
     def __init__(self, port, mac):
@@ -94,8 +100,6 @@ class Part4Controller(object):
         self._Allow_all_path()
 
     def cores21_setup(self):
-        self._Block()
-
         # Controller xử lí gói ICMP, ARP
         flow_mod = of.ofp_flow_mod()
         flow_mod.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
@@ -109,23 +113,6 @@ class Part4Controller(object):
         flow_mod = of.ofp_flow_mod()
         flow_mod.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
         self.connection.send(flow_mod)
-
-    # Chặn 
-    def _Block(self):
-        src_ip = IPS['hnotrust']
-        dst_ip = IPS['serv1']
-
-        block_icmp = of.ofp_flow_mod(
-            priority=20,
-            match=of.ofp_match(dl_type=0x800, nw_proto=pkt.ipv4.ICMP_PROTOCOL, nw_src=src_ip)
-        )
-        self.connection.send(block_icmp)
-
-        block_to_serv = of.ofp_flow_mod(
-            priority=19,
-            match=of.ofp_match(dl_type=0x800, nw_src=src_ip, nw_dst=dst_ip)
-        )
-        self.connection.send(block_to_serv)
 
     # used in part 4 to handle individual ARP packets
     # not needed for part 3 (USE RULES!)
@@ -149,6 +136,9 @@ class Part4Controller(object):
 
         packet_in = event.ofp  # The actual ofp_packet_in message.
 
+        if self._Block(packet, event) == 1:
+            return
+
         if packet.type == ethernet.ARP_TYPE:
             self._Handle_arp(packet, event)
         elif packet.type == ethernet.IP_TYPE:
@@ -156,149 +146,210 @@ class Part4Controller(object):
         else:
             log.info("Unhandled packet type: %s" % packet.type)
             print("Unhandled packet from %s" % packet.src)
+    
+    def _Block(self, packet, enent):
+        # Chặn traffic không phù hợp 
+        # Định danh địa chỉ MAC và IP nguồn, đích
+        eth_src = str(packet.src)  
+        eth_dst = str(packet.dst)  
+        ip_packet = packet.payload if packet.type == ethernet.IP_TYPE else None
+        # Nếu là gói tin IP, lấy thêm thông tin IP nguồn, IP đích
+        if ip_packet and isinstance(ip_packet, ipv4):
+            src_ip = str(ip_packet.srcip) 
+            dst_ip = str(ip_packet.dstip) 
+            protocol = ip_packet.protocol
+            # Kiểm tra yêu cầu chặn
+            if src_ip == "172.16.10.100": # Chăn gửi ICMP đến tất cả các host khác
+                if dst_ip == "10.0.4.10":
+                    # Chặn IP traffic đến serv1
+                    log.info(f"[Blocked] [IP traffic] [hnotrust1 to {dst_ip}]")
+                    return 1
+                if protocol == ipv4.ICMP_PROTOCOL:
+                    # Chặn ICMP đến các host khác
+                    log.info(f"[Blocked] [ICMP traffic] [hnotrust1 to hosts]")
+                    return 1
+        return 0
 
     def _Handle_arp(self, packet, event):
-        """Handle ARP packets."""
-
+        # Xử lí gói ARP
         arp_packet = packet.payload
         in_port = PORTS[str(arp_packet.protosrc)]
         dpid = self.connection.dpid
-
-        self._Update_arp_table(event.dpid, arp_packet.protosrc,
-                                in_port, packet.src)
-        log.info("Checking info ARP: " +packet.dump())
-
+        # Cập nhật ARP Table
+        self._Update_arp_table(event.dpid, str(arp_packet.protosrc), in_port, str(packet.src))
+        log.info("[PACKET_IN] [ARP]")
+        # Xử lí từng TH
         if arp_packet.opcode == arp.REQUEST:
-            self._Deal_arp_request(event, arp_packet, in_port, 
-                                    packet, dpid)
+            self._Deal_arp_request(event, arp_packet, in_port, packet, dpid)
         elif arp_packet.opcode == arp.REPLY:
-            self._Deal_arp_reply(event, arp_packet, in_port)
+            self._Deal_arp_reply(event, packet, arp_packet, in_port, dpid)
 
     def _Update_arp_table(self, dpid, ip, port, mac):
         if dpid not in self.arp_table:
             self.arp_table[dpid] = {}
         if ip not in self.arp_table[dpid]:
             self.arp_table[dpid][ip] = Entry(port, mac)
-        log.info("------>Installing entry on dpid %s for %s with port %s, mac %s " % (dpid, ip, port, mac))
-
-    def dpid_to_mac(self,dpid):
-        return EthAddr("%012x" % (dpid & 0xffFFffFFffFF,))
-
+        log.info(" [ENTRY]-->[DPID] %s [IP] %s [PORT] %s [MAC] %s" % (dpid, ip, port, mac))
 
     def _Deal_arp_request(self, event, arp_packet, in_port, packet, dpid):
-        protodst = arp_packet.protodst
+        log.info("----[ARP-REQUEST]")
+        protodst = str(arp_packet.protodst)
         if protodst in self.arp_table[dpid]:
-            log.info("Dealing with ARP request ---> 1")
-
             prt = self.arpTable[dpid][protodst].port
-            mac = self.arpTable[dpid][protodst].mac
-            
-            actions = []
-            actions.append(of.ofp_action_dl_addr.set_dst(mac))
-            actions.append(of.ofp_action_output(port = prt))
-            match = of.ofp_match.from_packet(packet, in_port)
-            match.dl_src = None # Wildcard source MAC
-            
-            msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
-                                    idle_timeout=FLOW_IDLE_TIMEOUT,
-                                    hard_timeout=of.OFP_FLOW_PERMANENT,
-                                    buffer_id=event.ofp.buffer_id,
-                                    actions=actions,
-                                    match=of.ofp_match.from_packet(packet, in_port))
-            self.connection.send(msg.pack())
-        elif str(protodst) in Gateway[str(arp_packet.protosrc)]:
-            a = packet.next
-            r = pkt.arp()
-            r.hwtype = a.hwtype
-            r.prototype = a.prototype
-            r.hwlen = a.hwlen
-            r.protolen = a.protolen
-            r.opcode = pkt.arp.REPLY
-            r.hwdst = a.hwsrc
-            r.protodst = a.protosrc
-            r.protosrc = a.protodst
-            r.hwsrc = self.dpid_to_mac(dpid)
-            e = pkt.ethernet(type=packet.type, src=self.dpid_to_mac(dpid), dst=a.hwsrc)
-            e.set_payload(r)
-            msg = of.ofp_packet_out()
-            msg.data = e.pack()
-            msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
-            msg.in_port = event.port
-            self._Update_arp_table(dpid, r.protosrc, event.port, r.hwsrc)
-            self.connection.send(msg)
-
-            actions = []
-            actions.append(of.ofp_action_dl_addr.set_dst(r.hwdst))
-            actions.append(of.ofp_action_output(port = event.port))
-            match = of.ofp_match.from_packet(packet, in_port)
-            match.dl_src = None # Wildcard source MAC
-            msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
-                                    idle_timeout=FLOW_IDLE_TIMEOUT,
-                                    hard_timeout=of.OFP_FLOW_PERMANENT,
-                                    buffer_id=event.ofp.buffer_id,
-                                    actions=actions,
-                                    match=of.ofp_match.from_packet(packet, in_port))
-            self.connection.send(msg.pack())
-        else:
+            mac = EthAddr(self.arpTable[dpid][protodst].mac)
+            # Thiết lập FLOW RULE
+            # Tạo gói ARP Request và gửi đến các cổng đồng thời cập nhật FLOW RULE trong trường hợp biết thông tin trong ARP-Table
             r = arp()
             r.hwtype = r.HW_TYPE_ETHERNET
             r.prototype = r.PROTO_TYPE_IP
             r.hwlen = 6
             r.protolen = r.protolen
-            r.opcode = r.REQUEST
-            r.hwdst = ETHER_BROADCAST
-            r.protodst = arp_packet.protodst
-            r.hwsrc = packet.src
+            r.opcode = r.REPLY
+            r.hwdst = arp_packet.hwsrc
+            r.protodst = arp_packet.protosrc
+            r.hwsrc = mac
             r.protosrc = arp_packet.protosrc
-            e = ethernet(type=ethernet.ARP_TYPE, src=packet.src, dst=ETHER_BROADCAST)
+            # Tạo gói Ethernet chứa ARP Request
+            e = ethernet(type=ethernet.ARP_TYPE, src=mac, dst=arp_packet.hwsrc)
+            # Đính kèm gói ARP
             e.set_payload(r)
-            log.debug("%i %i ARPing for %s on behalf of %s" % (dpid, in_port,
-            str(r.protodst), str(r.protosrc)))
+            # Đóng gói và gửi gói tin ra cổng 
             msg = of.ofp_packet_out()
             msg.data = e.pack()
-            msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
+            msg.actions.append(of.ofp_action_output(port = prt))
             msg.in_port = in_port
-            self._Update_arp_table(dpid, r.protosrc, in_port, r.hwsrc)
             self.connection.send(msg)
-
-    def _Deal_arp_reply(self, event, arp_packet, in_port):
-        if arp_packet.protodst in self.arp_table[self.connection.dpid]:
-            prt = self.arpTable[self.connection.dpid][arp_packet.protodst].port
-            mac = self.arpTable[self.connection.dpid][arp_packet.protodst].mac
+        else:
+            for host, ip in IPS.items():
+                # Tạo gói ARP Request và gửi đến các cổng trong trường hợp chưa biết MAC đích 
+                r = arp()
+                r.hwtype = r.HW_TYPE_ETHERNET
+                r.prototype = r.PROTO_TYPE_IP
+                r.hwlen = 6
+                r.protolen = 4
+                r.opcode = r.REQUEST
+                r.hwdst = ETHER_BROADCAST  # Gửi ARP Request đến tất cả các thiết bị trong mạng (broadcast)
+                r.protodst = struct.unpack("!I", socket.inet_aton(ip))[0]
+                r.hwsrc = packet.src 
+                r.protosrc = arp_packet.protosrc 
+                # Tạo gói Ethernet chứa ARP Request
+                e = ethernet(type=ethernet.ARP_TYPE, src=packet.src, dst=ETHER_BROADCAST)
+                # Đính kèm gói ARP
+                e.set_payload(r)
+                # Đóng gói và gửi gói tin ra cổng 
+                msg = of.ofp_packet_out()
+                msg.data = e.pack()  
+                msg.actions.append(of.ofp_action_output(port=PORTS[ip])) 
+                msg.in_port = in_port  
+                self.connection.send(msg) 
             
-            actions = []
-            actions.append(of.ofp_action_dl_addr.set_dst(mac))
-            actions.append(of.ofp_action_output(port = prt))
-            match = of.ofp_match.from_packet(packet, in_port)
-            match.dl_src = None # Wildcard source MAC
-            
-            msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
-                                    idle_timeout=FLOW_IDLE_TIMEOUT,
-                                    hard_timeout=of.OFP_FLOW_PERMANENT,
-                                    buffer_id=event.ofp.buffer_id,
-                                    actions=actions,
-                                    match=of.ofp_match.from_packet(packet, in_port))
-            
-            self.connection.send(msg.pack())
 
-    def _Handle_ip(self, packet, event):
-        ip_packet = packet.payload
-        dst_ip = ip_packet.dstip
-
-        log.info("Checking info ARP: " +packet.dump())
-
-        if dst_ip in self.arp_table[self.connection.dpid]:
-            dst_mac = self.arp-table[self.connection.dpid][ip_packet.protodst].mac
-            out_port = self.arp_table[self.connection.dpid][ip_packet.protodst].port
-            self.forward_packet(packet, event.ofp, out_port)
-
-    def forward_packet(self, packet, packet_in, out_port):
-        """Forward the packet to the specified port."""
+    def _Deal_arp_reply(self, event, packet, arp_packet, in_port, dpid):
+        log.info("----[ARP-REPLY]")
+        dst_ip_str = str(arp_packet.protodst)
+        # Cập nhật FLOW RULES
+        protodst = str(arp_packet.protodst)
+        prt = self.arp_table[dpid][protodst].port
+        mac = EthAddr(self.arp_table[dpid][protodst].mac)
+        actions = []
+        actions.append(of.ofp_action_dl_addr.set_dst(mac))
+        actions.append(of.ofp_action_output(port = prt))
+        match = of.ofp_match.from_packet(packet, in_port)
+        match.dl_src = None # Wildcard MAC
+        msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
+                                idle_timeout=FLOW_IDLE_TIMEOUT,
+                                hard_timeout=of.OFP_FLOW_PERMANENT,
+                                buffer_id=event.ofp.buffer_id,
+                                actions=actions,
+                                match=match)
+        self.connection.send(msg.pack())
+        # Tạo gói ARP Reply
+        r = arp()
+        r.hwtype = arp.HW_TYPE_ETHERNET
+        r.prototype = arp.PROTO_TYPE_IP
+        r.hwlen = 6
+        r.protolen = 4
+        r.opcode = arp.REPLY  
+        r.hwsrc = arp_packet.hwsrc  
+        r.protosrc = struct.unpack("!I", socket.inet_aton(Gateway[dst_ip_str]))[0]  
+        r.hwdst = arp_packet.hwdst  
+        r.protodst = arp_packet.protodst  
+        # Tạo gói Ethernet chứa ARP Reply
+        e = ethernet()
+        e.src = arp_packet.hwsrc 
+        e.dst = arp_packet.hwdst  
+        e.type = ethernet.ARP_TYPE
+        # Đính kèm gói ARP Reply
+        e.set_payload(r)  
+        # Đóng gói và gửi gói tin qua cổng nhận ARP Request
         msg = of.ofp_packet_out()
-        msg.data = packet_in
-        msg.actions.append(of.ofp_action_output(port=out_port))
+        msg.data = e.pack() 
+        msg.actions.append(of.ofp_action_output(port=PORTS[dst_ip_str]))
+        msg.in_port = in_port
         self.connection.send(msg)
 
+    def _Handle_ip(self, packet, event):
+        # Xử lí gói IP
+        ip_packet = packet.payload
+        protocol_packet = ip_packet.payload
+        dst_ip = ip_packet.dstip
+        log.info("[PACKET_IN] [IP]")
+        # Xử lí từng TH
+        if ip_packet.protocol == ipv4.TCP_PROTOCOL:
+            if str(dst_ip) in self.arp_table[self.connection.dpid]:
+                log.info("----[TCP]")
+                dst_mac = EthAddr(self.arp_table[self.connection.dpid][str(ip_packet.dstip)].mac)
+                out_port = self.arp_table[self.connection.dpid][str(ip_packet.dstip)].port
+                # Tạo gói Ethernet chứa ICMP
+                e = ethernet()
+                e.src = packet.src 
+                e.dst = dst_mac 
+                e.type = ethernet.IP_TYPE
+                # Đính kèm gói ICMP Reply
+                e.set_payload(ip_packet) 
+                # Đóng gói và gửi gói tin qua cổng
+                msg = of.ofp_packet_out()
+                msg.data = e.pack() 
+                msg.actions.append(of.ofp_action_output(port=out_port))
+                msg.in_port = event.port
+                self.connection.send(msg)
+        if ip_packet.protocol == ipv4.ICMP_PROTOCOL:
+            if protocol_packet.type == ECHO_REQUEST:
+                if str(dst_ip) in self.arp_table[self.connection.dpid]:
+                    log.info("----[ICMP-REQUEST]")
+                    dst_mac = EthAddr(self.arp_table[self.connection.dpid][str(ip_packet.dstip)].mac)
+                    out_port = self.arp_table[self.connection.dpid][str(ip_packet.dstip)].port
+                    # Tạo gói Ethernet chứa ICMP
+                    e = ethernet()
+                    e.src = packet.src 
+                    e.dst = dst_mac 
+                    e.type = ethernet.IP_TYPE
+                    # Đính kèm gói ICMP Reply
+                    e.set_payload(ip_packet) 
+                    # Đóng gói và gửi gói tin qua cổng
+                    msg = of.ofp_packet_out()
+                    msg.data = e.pack() 
+                    msg.actions.append(of.ofp_action_output(port=out_port))
+                    msg.in_port = event.port
+                    self.connection.send(msg)
+            if protocol_packet.type == ECHO_REPLY:
+                if str(dst_ip) in self.arp_table[self.connection.dpid]:
+                    log.info("----[ICMP-REPLY]")
+                    dst_mac = EthAddr(self.arp_table[self.connection.dpid][str(ip_packet.dstip)].mac)
+                    out_port = self.arp_table[self.connection.dpid][str(ip_packet.dstip)].port
+                    # Tạo gói Ethernet chứa ICMP
+                    e = ethernet()
+                    e.src = packet.src  
+                    e.dst = dst_mac  
+                    e.type = ethernet.IP_TYPE
+                    # Đính kèm gói tin ICMP Request
+                    e.set_payload(ip_packet)  
+                    # Đóng gói và gửi gói tin qua cổng
+                    msg = of.ofp_packet_out()
+                    msg.data = e.pack()  
+                    msg.actions.append(of.ofp_action_output(port=out_port))  
+                    msg.in_port = event.port
+                    self.connection.send(msg)
 
 def launch():
     """
